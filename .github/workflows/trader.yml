@@ -1,0 +1,64 @@
+name: Trader simulé
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # toutes les 10 min (GitHub peut retarder de quelques minutes)
+  workflow_dispatch:          # bouton « Run workflow » pour lancer un cycle à la main
+
+permissions:
+  contents: write   # enregistrer journal et état dans le dépôt
+  issues: write     # ouvrir une issue d'alerte à l'arrêt
+  actions: write    # désactiver le workflow à l'arrêt
+
+concurrency:
+  group: trader-simule
+  cancel-in-progress: false   # jamais deux cycles en même temps
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Cycle de simulation
+        id: cycle
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          MODELE_CLAUDE: ${{ vars.MODELE_CLAUDE }}
+          ANALYSES_MAX: ${{ vars.ANALYSES_MAX }}
+        run: |
+          deja_arrete=$([ -f ALERTE_ARRET.txt ] && echo 1 || echo 0)
+          python3 trader_simule.py --une-fois
+          if [ "$deja_arrete" = 0 ] && [ -f ALERTE_ARRET.txt ]; then
+            echo "arret=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enregistrer journal et état
+        if: always()
+        run: |
+          git config user.name "trader-simule"
+          git config user.email "trader-simule@users.noreply.github.com"
+          git add paris_script.txt etat_script.json 2>/dev/null || true
+          [ -f ALERTE_ARRET.txt ] && git add ALERTE_ARRET.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "Cycle $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
+          exit 1
+
+      - name: Alerte d'arrêt
+        if: steps.cycle.outputs.arret == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --title "Trader simulé arrêté" --body-file ALERTE_ARRET.txt
+          gh workflow disable "Trader simulé"
+          echo "::error::Simulation arrêtée — voir paris_script.txt"
+          exit 1
