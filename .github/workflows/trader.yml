@@ -19,21 +19,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Vérifier la clé Anthropic
+        id: cle
+        env:
+          CLE: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$CLE" ]; then
+            echo "::warning::Secret ANTHROPIC_API_KEY absent : cycle sauté. Ajoute-le dans Settings → Secrets and variables → Actions."
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+        if: steps.cle.outputs.ok == '1'
+
+      - uses: actions/setup-python@v6
+        if: steps.cle.outputs.ok == '1'
         with:
           python-version: "3.12"
 
       - run: pip install -r requirements.txt
+        if: steps.cle.outputs.ok == '1'
 
       - name: Cycle de simulation
         id: cycle
+        if: steps.cle.outputs.ok == '1'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           MODELE_CLAUDE: ${{ vars.MODELE_CLAUDE }}
           ANALYSES_MAX: ${{ vars.ANALYSES_MAX }}
+          X_BUDGET_JOUR: ${{ vars.X_BUDGET_JOUR }}
+          X_POSTS: ${{ vars.X_POSTS }}
         run: |
           deja_arrete=$([ -f ALERTE_ARRET.txt ] && echo 1 || echo 0)
           python3 trader_simule.py --une-fois
@@ -42,12 +60,13 @@ jobs:
           fi
 
       - name: Enregistrer journal et état
-        if: always()
+        if: always() && steps.cle.outputs.ok == '1'
         run: |
           git config user.name "trader-simule"
           git config user.email "trader-simule@users.noreply.github.com"
-          git add paris_script.txt etat_script.json 2>/dev/null || true
-          [ -f ALERTE_ARRET.txt ] && git add ALERTE_ARRET.txt
+          for f in paris_script.txt etat_script.json ALERTE_ARRET.txt; do
+            [ -f "$f" ] && git add "$f"
+          done
           git diff --cached --quiet && exit 0
           git commit -m "Cycle $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
