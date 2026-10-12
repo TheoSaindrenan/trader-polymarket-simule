@@ -31,6 +31,8 @@ Installation
 Variables d'environnement (à définir toi-même, le script ne les demande pas)
   ANTHROPIC_API_KEY   obligatoire — estimation des probabilités
   X_BEARER_TOKEN      facultatif — sans lui, l'étape X est sautée et notée
+  X_BUDGET_JOUR       facultatif — budget X en $ par jour (défaut : 1)
+  X_POSTS             facultatif — posts lus par recherche X (défaut : 20)
   MODELE_CLAUDE       facultatif — défaut : claude-sonnet-5-5
   ANALYSES_MAX        facultatif — nouvelles analyses max par cycle (défaut : 20)
   DOSSIER_TRADER      facultatif — où écrire journal et état (défaut : dossier du script)
@@ -87,6 +89,11 @@ CONFIG = {
     "prix_max_considere": 0.96,
     "modele": os.environ.get("MODELE_CLAUDE") or "claude-sonnet-5-5",
     "recherche_web": True,
+    # X : consulté seulement pour les finalistes, avec un budget quotidien
+    "seuil_x": 0.05,              # écart provisoire (sans X) à partir duquel on consulte X
+    "x_posts": int(os.environ.get("X_POSTS") or 20),              # posts lus par recherche (10 à 100)
+    "x_budget_jour": float(os.environ.get("X_BUDGET_JOUR") or 1.0),  # en dollars
+    "x_cout_post": float(os.environ.get("X_COUT_POST") or 0.005),    # tarif à l'usage par post lu
 }
 
 DOSSIER = Path(os.environ.get("DOSSIER_TRADER") or Path(__file__).resolve().parent)
@@ -306,14 +313,29 @@ RE_PROMO = re.compile(
 RE_BOT = re.compile(r"(\bbot\b|automated|automatique|auto-?post|feed of|flux automatique)", re.I)
 
 
-def chercher_x(requete):
-    """Renvoie (texte formaté pour Claude, nombre retenu, nombre écarté) ou None si X non configuré."""
+def budget_x_restant(etat):
+    """Nombre de posts X encore lisibles aujourd'hui (UTC)."""
+    jour = maintenant().strftime("%Y-%m-%d")
+    d = etat.setdefault("x_depense", {"jour": jour, "posts": 0, "total_posts": 0})
+    if d["jour"] != jour:
+        d["jour"], d["posts"] = jour, 0
+    plafond = int(CONFIG["x_budget_jour"] / CONFIG["x_cout_post"])
+    return max(plafond - d["posts"], 0)
+
+
+def chercher_x(requete, etat):
+    """Renvoie (texte formaté pour Claude, nombre retenu, nombre écarté), ou None si X
+    n'est pas configuré ou si le budget du jour est épuisé."""
     jeton = os.environ.get("X_BEARER_TOKEN")
     if not jeton or not requete:
         return None
+    n = min(CONFIG["x_posts"], budget_x_restant(etat))
+    if n < 10:   # minimum imposé par l'API
+        info("budget X du jour épuisé : analyse sans X")
+        return None
     params = {
         "query": f"({requete}) -is:retweet -is:nullcast",   # nullcast = posts sponsorisés
-        "max_results": 100,
+        "max_results": max(10, min(n, 100)),
         "tweet.fields": "created_at,public_metrics,author_id,lang",
         "expansions": "author_id",
         "user.fields": "created_at,description,public_metrics,verified,verified_type,username",
@@ -323,6 +345,9 @@ def chercher_x(requete):
     except Exception as e:
         info(f"X indisponible : {e}")
         return None
+    lus = len(d.get("data", []))
+    etat["x_depense"]["posts"] += lus
+    etat["x_depense"]["total_posts"] = etat["x_depense"].get("total_posts", 0) + lus
     auteurs = {u["id"]: u for u in d.get("includes", {}).get("users", [])}
     now = maintenant()
     retenus, ecartes = [], 0
@@ -403,7 +428,7 @@ def estimer_probabilite(m, source, posts_x):
                "que la PREMIÈRE issue l'emporte selon les règles exactes. Le prix du marché ne "
                "t'est volontairement pas donné : ne cherche pas à le deviner, raisonne sur les faits. "
                "Termine par un objet JSON.")
-    bloc_x = posts_x if posts_x is not None else "(recherche X non disponible pour ce cycle)"
+    bloc_x = posts_x if posts_x is not None else "(pas de posts X pour cette estimation)"
     message = f"""Date actuelle : {maintenant().strftime('%Y-%m-%d %H:%M UTC')}
 Fin du marché : {m['fin'].strftime('%Y-%m-%d %H:%M UTC')}
 Question : {m['question']}
@@ -442,11 +467,18 @@ def analyser(m, etat, forcer=False):
         age_h = (maintenant() - parse_date(cache["quand"])).total_seconds() / 3600
         if age_h < CONFIG["cache_analyse_h"] and abs(cache["prix"] - m["prix"][0]) < CONFIG["cache_ecart_prix"]:
             return cache["p"], cache["raison"], False
-    x = chercher_x(regles["requete_x"])
-    posts = x[0] if x else None
-    p, raison, sources = estimer_probabilite(m, regles["source"], posts)
+    # Première estimation sans X ; X n'est consulté que si le marché devient finaliste
+    # (écart provisoire ≥ seuil_x) ou si c'est un pari ouvert qu'on réévalue.
+    p, raison, sources = estimer_probabilite(m, regles["source"], None)
+    finaliste = forcer or abs(p - m["prix"][0]) >= CONFIG["seuil_x"]
+    x = chercher_x(regles["requete_x"], etat) if finaliste else None
     if x:
-        raison += f" [X : {x[1]} posts retenus, {x[2]} écartés]"
+        p_sans_x = p
+        p, raison, sources = estimer_probabilite(m, regles["source"], x[0])
+        raison += (f" [X : {x[1]} posts retenus, {x[2]} écartés ; "
+                   f"estimation sans X {pct(p_sans_x)} → avec X {pct(p)}]")
+    elif finaliste and os.environ.get("X_BEARER_TOKEN"):
+        raison += " [X non consulté : budget du jour épuisé ou API indisponible]"
     if sources:
         raison += f" [sources : {', '.join(map(str, sources[:3]))}]"
     etat["cache_analyses"][m["id"]] = {"p": p, "raison": raison, "prix": m["prix"][0],
@@ -639,7 +671,9 @@ def bilan(etat, titre="BILAN"):
               f"Valeur : {dollars(total)} (départ {dollars(depart)}, "
               f"{'+' if total >= depart else ''}{pct(total / depart - 1)}) | plus haut {dollars(etat['plus_haut'])}",
               f"Paris clos : {len(h)} dont {len(gagnants)} gagnants | ouverts : {len(etat['positions'])} | "
-              f"cycles : {etat['cycles']}"]
+              f"cycles : {etat['cycles']}",
+              f"Posts X lus au total : {etat.get('x_depense', {}).get('total_posts', 0)} "
+              f"(≈ {dollars(etat.get('x_depense', {}).get('total_posts', 0) * CONFIG['x_cout_post'])})"]
     for x in h[-20:]:
         lignes.append(f"  {'+' if x['gain'] >= 0 else ''}{dollars(x['gain'])} — {x['libelle']} — "
                       f"{x['question'][:70]} ({x['motif'][:60]})")
